@@ -7,6 +7,7 @@
 #property link      "https://www.mql5.com"
 #property version   "1.00"
 
+#include <Trade/Trade.mqh>
 #include <Trade/SymbolInfo.mqh>
 
 // Input parameters
@@ -31,17 +32,18 @@ int moving_average_handle;
 
 // Symbol information
 CSymbolInfo symbol; 
-
-// Order routing classes
-MqlTradeRequest request;
-MqlTradeResult result;
-MqlTradeCheckResult check_result;
+CTrade       trade;
 
 // Time control structures
 MqlDateTime start_time, end_time, close_time;
 
 // New candle verification
-static int bars;
+static datetime last_bar_time = 0;
+
+// Day‑tracking
+static datetime day_start_time = 0;
+static double   day_profit    = 0;
+static double   day_loss      = 0;
 
 // Enum for buy/sell signals
 enum ENUM_SIGNAL {BUY = 1, SELL  = -1, NONE   = 0};
@@ -49,132 +51,265 @@ enum ENUM_SIGNAL {BUY = 1, SELL  = -1, NONE   = 0};
 // Stores the last trade signal
 ENUM_SIGNAL last_signal;
 
-// Validate inputs and initialize EA
+//+------------------------------------------------------------------+
+//| Validate inputs and initialize EA                                 |
+//+------------------------------------------------------------------+
 int OnInit()
- {
+  {
    if(!symbol.Name(_Symbol))
-   {
+     {
       Print("Error loading symbol.");
-      return INIT_FAILED;
-   }
+      return(INIT_FAILED);
+     }
 
    moving_average_handle = iMA(_Symbol, TimeFrame, MovingAverage, 0, MODE_EMA, PRICE_CLOSE);
-   
-   if (moving_average_handle < 0) 
-   {
+   if(moving_average_handle < 0)
+     {
       Print("Error initializing moving average.");
-      return INIT_FAILED;
-   }
-   
-   if (MovingAverage < 0 || TakeProfit < 0 || BreakEven < 0 || PartialProfit < 0 || PartialVol < 0 || ProfitLimit < 0 || LossLimit < 0)
-   {
-      Print("Invalid parameters.");
-      return INIT_FAILED;
-   }
+      return(INIT_FAILED);
+     }
 
    // Initialize time variables
    TimeToStruct(StringToTime(StartTime), start_time);
-   TimeToStruct(StringToTime(EndTime), end_time);
+   TimeToStruct(StringToTime(EndTime),   end_time);
    TimeToStruct(StringToTime(CloseTime), close_time);
-   
-   // Validate input times
-   if( (start_time.hour > end_time.hour || (start_time.hour == end_time.hour && start_time.min > end_time.min))
-         || end_time.hour > close_time.hour || (end_time.hour == close_time.hour && end_time.min > close_time.min))
-   {
-      Print("Invalid trading times.");
-      return INIT_FAILED;
-   }
-   
+
    last_signal = NONE;
-   
+   day_start_time = iTime(_Symbol, PERIOD_D1, 0);
    return(INIT_SUCCEEDED);
- }
+  }
 
-// Define missing functions to prevent errors
+//+------------------------------------------------------------------+
+//| Detect a new trading day                                          |
+//+------------------------------------------------------------------+
 bool IsNewDay()
-{
-   return false;
-}
+  {
+   datetime today = iTime(_Symbol, PERIOD_D1, 0);
+   if(today != day_start_time)
+     {
+      // reset counters
+      day_start_time = today;
+      day_profit = 0;
+      day_loss   = 0;
+      return(true);
+     }
+   return(false);
+  }
 
+//+------------------------------------------------------------------+
+//| Detect a new completed candle on chosen timeframe                 |
+//+------------------------------------------------------------------+
 bool IsNewCandle()
-{
-   return false;
-}
+  {
+   datetime bar_time = iTime(_Symbol, TimeFrame, 0);
+   if(bar_time != last_bar_time)
+     {
+      last_bar_time = bar_time;
+      return(true);
+     }
+   return(false);
+  }
 
+//+------------------------------------------------------------------+
+//| Check daily profit / loss limits                                  |
+//+------------------------------------------------------------------+
 bool CheckLimits()
-{
-   return false;
-}
+  {
+   double equity_now  = AccountInfoDouble(ACCOUNT_EQUITY);
+   double profit_now  = AccountInfoDouble(ACCOUNT_PROFIT);
+   double today_pl    = profit_now - (day_profit - day_loss);
 
+   if(today_pl >= ProfitLimit)
+     {
+      Print("Daily profit limit reached.");
+      return(true);
+     }
+   if(today_pl <= -LossLimit)
+     {
+      Print("Daily loss limit reached.");
+      return(true);
+     }
+   return(false);
+  }
+
+//+------------------------------------------------------------------+
+//| Generate trading signal                                           |
+//+------------------------------------------------------------------+
 ENUM_SIGNAL CheckSignal()
-{
-   return NONE;
-}
+  {
+   double ma[];
+   double close[];
+   if(CopyBuffer(moving_average_handle, 0, 1, 2, ma) != 2) return(NONE);
+   if(CopyClose(_Symbol, TimeFrame, 1, 2, close) != 2)     return(NONE);
 
+   if(close[0] > ma[0]) return(BUY);
+   if(close[0] < ma[0]) return(SELL);
+   return(NONE);
+  }
+
+//+------------------------------------------------------------------+
+//| Manage existing open positions                                    |
+//+------------------------------------------------------------------+
 void ManageOpenPositions(ENUM_SIGNAL signal)
-{
-   // Implement trade management logic
-}
+  {
+   for(int i=PositionsTotal()-1; i>=0; i--)
+     {
+      ulong   ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != magic_number) continue;
 
+      double entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl          = PositionGetDouble(POSITION_SL);
+      double tp          = PositionGetDouble(POSITION_TP);
+      long   type        = PositionGetInteger(POSITION_TYPE);
+
+      // Close if opposite signal appears
+      if((signal == BUY && type == POSITION_TYPE_SELL) || (signal == SELL && type == POSITION_TYPE_BUY))
+         trade.PositionClose(ticket);
+
+      // Update trailing stop / break‑even
+      double current_price = (type==POSITION_TYPE_BUY)?symbol.Bid():symbol.Ask();
+      double distance      = (type==POSITION_TYPE_BUY)?(current_price-entry_price):(entry_price-current_price);
+
+      if(distance*symbol.Point() >= BreakEven && sl == 0)
+        {
+         double new_sl = entry_price;
+         trade.PositionModify(ticket, new_sl, tp);
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Cancel opposite pending orders                                    |
+//+------------------------------------------------------------------+
 void ClosePendingOrders(ENUM_SIGNAL signal)
-{
-   // Implement order closing logic
-}
+  {
+   for(int i=OrdersTotal()-1; i>=0; i--)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(!OrderSelect(ticket)) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != magic_number) continue;
 
+      long type = OrderGetInteger(ORDER_TYPE);
+      if((signal==BUY && (type==ORDER_TYPE_SELL_LIMIT||type==ORDER_TYPE_SELL_STOP)) ||
+         (signal==SELL && (type==ORDER_TYPE_BUY_LIMIT||type==ORDER_TYPE_BUY_STOP)))
+         trade.OrderDelete(ticket);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Take partial profits                                              |
+//+------------------------------------------------------------------+
 void ManagePartialProfit()
-{
-   // Implement partial profit logic
-}
+  {
+   for(int i=PositionsTotal()-1; i>=0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != magic_number) continue;
 
-void ApplyBreakEven()
-{
-   // Implement break-even logic
-}
+      long   type        = PositionGetInteger(POSITION_TYPE);
+      double entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
+      double current     = (type==POSITION_TYPE_BUY)?symbol.Bid():symbol.Ask();
+      double distance    = (type==POSITION_TYPE_BUY)?(current-entry_price):(entry_price-current);
 
+      if(distance*symbol.Point() >= PartialProfit && PositionGetDouble(POSITION_VOLUME) >= PartialVol)
+        {
+         trade.PositionClosePartial(ticket, PartialVol);
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Additional break‑even logic (handled in ManageOpenPositions)      |
+//+------------------------------------------------------------------+
+void ApplyBreakEven(){}
+
+//+------------------------------------------------------------------+
+//| Open new trades if conditions met                                 |
+//+------------------------------------------------------------------+
 void ExecuteNewTrade(ENUM_SIGNAL signal)
-{
-   // Implement trade execution logic
-}
+  {
+   if(signal == NONE) return;
 
+   // Check trading window
+   datetime now = TimeCurrent();
+   MqlDateTime st, et; TimeToStruct(now, st); et = st;
+   st.hour = start_time.hour; st.min = start_time.min;
+   et.hour = end_time.hour;   et.min = end_time.min;
+
+   if(now < StructToTime(st) || now > StructToTime(et)) return;
+
+   // Avoid multiple positions in same direction
+   for(int i=PositionsTotal()-1;i>=0;i--)
+     {
+      if(!PositionSelectByIndex(i)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) == magic_number && PositionGetInteger(POSITION_TYPE) == ((signal==BUY)?POSITION_TYPE_BUY:POSITION_TYPE_SELL))
+         return;
+     }
+
+   double sl = 0; // could be set to opposite side of MA, left 0 for simplicity
+   double tp = (signal==BUY)?(symbol.Ask()+TakeProfit*symbol.Point()):(symbol.Bid()-TakeProfit*symbol.Point());
+
+   trade.SetExpertMagicNumber(magic_number);
+   trade.SetDeviationInPoints(10);
+   if(signal==BUY)
+      trade.Buy(Volume, NULL, symbol.Ask(), sl, tp);
+   else if(signal==SELL)
+      trade.Sell(Volume, NULL, symbol.Bid(), sl, tp);
+  }
+
+//+------------------------------------------------------------------+
+//| Close all trades at daily close time                              |
+//+------------------------------------------------------------------+
 void CheckClosingTime()
-{
-   // Implement closing time logic
-}
+  {
+   datetime now = TimeCurrent();
+   MqlDateTime ct; TimeToStruct(now, ct);
+   if(ct.hour == close_time.hour && ct.min >= close_time.min)
+     {
+      for(int i=PositionsTotal()-1;i>=0;i--)
+        {
+         ulong ticket = PositionGetTicket(i);
+         if(!PositionSelectByTicket(ticket)) continue;
+         if(PositionGetInteger(POSITION_MAGIC) != magic_number) continue;
+         trade.PositionClose(ticket);
+        }
+     }
+  }
 
-// Event triggered on EA restart
+//+------------------------------------------------------------------+
+//| Event triggered on EA de‑initialization                           |
+//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
- {
-   printf("Restarting EA: %d", reason);
- }
-  
-// Event triggered on each new tick
+  {
+   Print("EA stopped. Reason:", reason);
+  }
+
+//+------------------------------------------------------------------+
+//| Event triggered on each new tick                                  |
+//+------------------------------------------------------------------+
 void OnTick()
-{
-   if(!symbol.RefreshRates())
-      return;
-     
-   if (IsNewDay())
-   {
-      last_signal = NONE;
-   }
-   
-   if (last_signal == NONE)
+  {
+   if(!symbol.RefreshRates()) return;
+
+   if(IsNewDay()) last_signal = NONE;
+
+   if(last_signal == NONE)
       last_signal = CheckSignal();
 
-   bool new_candle = IsNewCandle();
-   
-   if(new_candle)
-   {
-      if (CheckLimits()) 
-         return;
-   
-      ENUM_SIGNAL signal = CheckSignal();
-      
-      ManageOpenPositions(signal);
-      ClosePendingOrders(signal);
-      ManagePartialProfit();
-      ApplyBreakEven();
-      ExecuteNewTrade(signal);
-      CheckClosingTime();
-   }
-}
+   if(!IsNewCandle()) return;
+
+   if(CheckLimits()) return;
+
+   ENUM_SIGNAL signal = CheckSignal();
+
+   ManageOpenPositions(signal);
+   ClosePendingOrders(signal);
+   ManagePartialProfit();
+   ApplyBreakEven();
+   ExecuteNewTrade(signal);
+   CheckClosingTime();
+  }
+
+//+------------------------------------------------------------------+
